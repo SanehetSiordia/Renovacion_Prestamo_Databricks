@@ -256,6 +256,7 @@ jobs:
                   "esquema_silver": "silver",
                   "esquema_golden": "golden",
                   "external_locations_raw": "exlt-raw",
+                  "external_locations_bronze": "exlt-bronze",
                   "group_data_analysts": "data_analysts",
                   "group_data_engineers": "data_engineers",
                   "table_silver": "renovacion_prestamo_transformed",
