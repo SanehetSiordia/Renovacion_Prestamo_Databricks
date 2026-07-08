@@ -2,7 +2,7 @@ name: Dynamic Databricks Notebook Deploy
 on:
   push:
     branches: [ "main" ]
-    
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -48,25 +48,26 @@ jobs:
           nb_name=$(basename "$nb")
           local_file="notebooks_to_deploy/$nb_name.py"
           dest_path="$DEST_BASE/$nb_name"
-
+          
           full_origin_path="$NOTEBOOK_BASE/$nb"
           encoded_path=$(jq -nr --arg p "$full_origin_path" '$p | @uri')
 
           echo "Exportando desde Origen: $full_origin_path"
-          curl -s -X GET \
+          
+          export_response=$(curl -s -X GET \
             -H "Authorization: Bearer $ORIGIN_TOKEN" \
-            "$ORIGIN_HOST/api/2.0/workspace/export?path=$encoded_path&format=SOURCE" \
-            | jq -r '.content' | base64 --decode > "$local_file"
-
+            "$ORIGIN_HOST/api/2.0/workspace/export?path=$encoded_path&format=SOURCE")
+          
+          echo "$export_response" | jq -r '.content' | base64 --decode > "$local_file"
+                    
           echo "Importando a Destino Plano: $dest_path"
           response=$(curl -s -X POST \
             -H "Authorization: Bearer $DEST_TOKEN" \
             -H "Content-Type: multipart/form-data" \
             -F "path=$dest_path" \
             -F "format=SOURCE" \
-            -F "language=PYTHON" \
             -F "overwrite=true" \
-            -F "file=@$local_file" \
+            -F "content=@$local_file" \
             "$DEST_HOST/api/2.0/workspace/import")
           echo "Response: $response"
         done
