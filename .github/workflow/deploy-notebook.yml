@@ -1,0 +1,341 @@
+name: Dynamic Databricks Notebook Deploy
+on:
+  push:
+    branches:
+      - main
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+    
+    - name: Install jq & curl
+      run: sudo apt-get update && sudo apt-get install -y jq curl
+    
+    - name: Export and Deploy Notebooks (Flattened Target)
+      run: |
+        ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
+        ORIGIN_TOKEN=${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        
+        NOTEBOOK_BASE="/Workspace/Renovacion_Prestamo_Databricks"
+        DEST_BASE="/Renovacion_Prestamo_Databricks_Prod/deploy"
+        
+        NOTEBOOKS=("PreAmb/Preparacion_Ambiente"
+          "proceso/1a.-Bronze-Extract_Clientes_Info_Operacional_Data"
+          "proceso/1b.-Bronze-Extract_Clientes_Score_Operacional_Data"
+          "proceso/2.-Silver-Transform_Renovacion_Prestamo_Data"
+          "proceso/3.-Golden-Load_Renovacion_Prestamo"
+          "seguridad/Grants_Security")
+
+        mkdir -p notebooks_to_deploy
+
+        # 1. Crear la carpeta base de despliegue una sola vez en el destino
+        echo "Creando carpeta base de producción: $DEST_BASE"
+        curl -s -X POST \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"path\":\"$DEST_BASE\"}" \
+          "$DEST_HOST/api/2.0/workspace/mkdirs"
+        
+        # 2. Iterar sobre cada notebook para exportar (con estructura) e importar (plano)
+        for nb in "${NOTEBOOKS[@]}"; do
+          echo "----------------------------------------"
+          
+          # Extraer solo el nombre del notebook (ej: "Preparacion_Ambiente")
+          nb_name=$(basename "$nb")
+          local_file="notebooks_to_deploy/$nb_name.py"
+          dest_path="$DEST_BASE/$nb_name"
+
+          full_origin_path="$NOTEBOOK_BASE/$nb"
+          encoded_path=$(jq -nr --arg p "$full_origin_path" '$p | @uri')
+
+          echo "Exportando desde Origen: $full_origin_path"
+          curl -s -X GET \
+            -H "Authorization: Bearer $ORIGIN_TOKEN" \
+            "$ORIGIN_HOST/api/2.0/workspace/export?path=$encoded_path&format=SOURCE" \
+            | jq -r '.content' | base64 --decode > "$local_file"
+
+          echo "Importando a Destino Plano: $dest_path"
+          response=$(curl -s -X POST \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            -H "Content-Type: multipart/form-data" \
+            -F "path=$dest_path" \
+            -F "format=SOURCE" \
+            -F "language=PYTHON" \
+            -F "overwrite=true" \
+            -F "file=@$local_file" \
+            "$DEST_HOST/api/2.0/workspace/import")
+          echo "Response: $response"
+        done
+    
+    - name: Check if workflow exists and delete if necessary
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        WORKFLOW_NAME="WF_ETL_Renovacion_Prestamo_PROD"
+        
+        echo "Verificando si existe el workflow: $WORKFLOW_NAME"
+        
+        # Listar todos los workflows y buscar por nombre
+        workflows_response=$(curl -s -X GET \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.1/jobs/list")
+        
+        # Extraer job_id si existe el workflow
+        existing_job_id=$(echo "$workflows_response" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
+        
+        if [ "$existing_job_id" != "" ] && [ "$existing_job_id" != "null" ]; then
+          echo "Workflow encontrado con ID: $existing_job_id. Eliminando..."
+          delete_response=$(curl -s -X POST \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"job_id\": $existing_job_id}" \
+            "$DEST_HOST/api/2.1/jobs/delete")
+          echo "Delete response: $delete_response"
+        else
+          echo "No se encontró workflow existente con nombre: $WORKFLOW_NAME"
+        fi
+    
+    - name: Get existing cluster ID
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        CLUSTER_NAME="cluster_SD"
+        
+        echo "Buscando cluster existente: $CLUSTER_NAME"
+                
+        clusters_response=$(curl -s -X GET \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.0/clusters/list")
+        
+        echo "Clusters response: $clusters_response"
+        cluster_id=$(echo "$clusters_response" | jq -r --arg name "$CLUSTER_NAME" '.clusters[]? | select(.cluster_name == $name) | .cluster_id')
+        
+        if [ "$cluster_id" != "" ] && [ "$cluster_id" != "null" ]; then
+          echo "✅ Cluster encontrado: $CLUSTER_NAME con ID: $cluster_id"
+          echo "CLUSTER_ID=$cluster_id" >> $GITHUB_ENV
+        else
+          echo "❌ No se encontró el cluster: $CLUSTER_NAME"
+          echo "Clusters disponibles:"
+          echo "$clusters_response" | jq -r '.clusters[]? | .cluster_name'
+          exit 1
+        fi
+    
+    - name: Create Databricks Workflow WF_ETL_Renovacion_Prestamo_PROD
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        CLUSTER_ID="${{ env.CLUSTER_ID }}"
+        
+        echo "Creando workflow: WF_ETL_Renovacion_Prestamo_PROD con cluster existente ID: $CLUSTER_ID"
+        
+        # Crear el JSON del workflow usando cluster existente
+        cat > workflow_config.json << EOF
+        {
+          "name": "WF_ETL_Renovacion_Prestamo_PROD",
+          "tasks": [
+            {
+              "task_key": "tarea0_preamb",
+              "description": "Ejecuta Preparacion de Ambiente",
+              "notebook_task": {
+                "notebook_path": "/Renovacion_Prestamo_Databricks_Prod/deploy/Preparacion_Ambiente",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2
+            },
+            {
+              "task_key": "tarea1a_Extract_Clientes_Info_Operacional_Data",
+              "description": "Ejecuta capa bronze extraccion de informacion Operacional de Clientes",
+              "notebook_task": {
+                "notebook_path": "/Renovacion_Prestamo_Databricks_Prod/deploy/1a.-Bronze-Extract_Clientes_Info_Operacional_Data",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "tarea0_preamb"
+                }
+              ]
+            },
+            {
+              "task_key": "tarea1b_Extract_Clientes_Score_Operacional_Data",
+              "description": "Ejecuta capa bronze extraccion de informacion Score de Clientes",
+              "notebook_task": {
+                "notebook_path": "/Renovacion_Prestamo_Databricks_Prod/deploy/1b.-Bronze-Extract_Clientes_Score_Operacional_Data",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "tarea0_preamb"
+                }
+              ]
+            },
+            {
+              "task_key": "tarea2_Transform_Renovacion_Prestamo_Data",
+              "description": "Ejecuta capa silver transformacion de datos para analisis con Machine Learning",
+              "notebook_task": {
+                "notebook_path": "/Renovacion_Prestamo_Databricks_Prod/deploy/2.-Silver-Transform_Renovacion_Prestamo_Data",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                { "task_key": "tarea1a_Extract_Clientes_Info_Operacional_Data" },
+                { "task_key": "tarea1b_Extract_Clientes_Score_Operacional_Data" }
+              ]
+            },
+            {
+              "task_key": "tarea3_Load_Renovacion_Prestamo",
+              "description": "Ejecuta capa golden carga de datos con informacion estadistica relevante para negocio",
+              "notebook_task": {
+                "notebook_path": "/Renovacion_Prestamo_Databricks_Prod/deploy/3.-Golden-Load_Renovacion_Prestamo",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "tarea2_Transform_Renovacion_Prestamo_Data"
+                }
+              ]
+            },
+            {
+              "task_key": "tarea4_Grants",
+              "description": "Ejecuta capa de segurdiad para otorgar permisos a grupos de usuarios",
+              "notebook_task": {
+                "notebook_path": "/Renovacion_Prestamo_Databricks_Prod/deploy/Grants_Security",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "timeout_seconds": 3600,
+              "max_retries": 2,
+              "depends_on": [
+                {
+                  "task_key": "tarea3_Load_Renovacion_Prestamo"
+                }
+              ]
+            }
+          ],
+          "schedule": {
+            "quartz_cron_expression": "0 0 8 * * ?",
+            "timezone_id": "America/Mazatlan",
+            "pause_status": "PAUSED"
+          },
+          "email_notifications": {
+            "on_failure": ["carpediem.sinhue@gmail.com"],
+            "on_success": ["carpediem.sinhue@gmail.com"],
+            "no_alert_for_skipped_runs": false
+          },
+          "webhook_notifications": {},
+          "timeout_seconds": 7200,
+          "max_concurrent_runs": 1,
+          "tags": {
+            "environment": "production",
+            "created_by": "github_actions",
+            "project": "automated_deployment",
+            "cluster_used": "cluster_SD"
+          }
+        }
+        EOF
+        
+        # Crear el workflow
+        create_response=$(curl -s -X POST \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d @workflow_config.json \
+          "$DEST_HOST/api/2.1/jobs/create")
+        
+        echo "Workflow creation response: $create_response"
+        
+        # Extraer job_id del response
+        job_id=$(echo "$create_response" | jq -r '.job_id')
+        
+        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
+          echo "✅ Workflow 'WF_ETL_Renovacion_Prestamo_PROD' creado exitosamente con ID: $job_id"
+          
+          # Obtener detalles del workflow creado
+          workflow_details=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.1/jobs/get?job_id=$job_id")
+          
+          echo "Detalles del workflow:"
+          echo "$workflow_details" | jq '.settings | {name, tasks: (.tasks | map({task_key, notebook_task: .notebook_task.notebook_path}))}'
+        else
+          echo "❌ Error al crear el workflow"
+          echo "Response completo: $create_response"
+          exit 1
+        fi
+    
+    - name: Validate Workflow Configuration
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        WORKFLOW_NAME="WF_ETL_Renovacion_Prestamo_PROD"
+        
+        echo "🔍 Validando la configuración del workflow creado..."
+        
+        # Obtener lista de workflows y encontrar el recién creado
+        workflows_list=$(curl -s -X GET \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.1/jobs/list")
+        
+        job_id=$(echo "$workflows_list" | jq -r --arg name "$WORKFLOW_NAME" '.jobs[]? | select(.settings.name == $name) | .job_id')
+        
+        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
+          echo "✅ Workflow encontrado con ID: $job_id"
+          
+          # Obtener configuración detallada
+          job_details=$(curl -s -X GET \
+            -H "Authorization: Bearer $DEST_TOKEN" \
+            "$DEST_HOST/api/2.1/jobs/get?job_id=$job_id")
+          
+          echo "📋 Resumen del workflow:"
+          echo "Nombre: $(echo "$job_details" | jq -r '.settings.name')"
+          echo "Número de tareas: $(echo "$job_details" | jq '.settings.tasks | length')"
+          echo ""
+          echo "📝 Tareas configuradas:"
+          echo "$job_details" | jq -r '.settings.tasks[] | "- " + .task_key + " → " + .notebook_task.notebook_path'
+          echo ""
+          echo "🖥️  Cluster configurado:"
+          echo "Cluster ID: $(echo "$job_details" | jq -r '.settings.tasks[0].existing_cluster_id')"
+          echo "Cluster Name: cluster_SD (reutilizado)"
+          
+        else
+          echo "❌ No se pudo encontrar el workflow creado"
+          exit 1
+        fi
+    
+    - name: Clean up
+      run: |
+        rm -rf notebooks_to_deploy
+        rm -f workflow_config.json
+    
+    - name: Done
+      run: |
+        echo "🎉 ¡Despliegue completado exitosamente!"
+        echo ""
+        echo "Resumen:"
+        echo "Notebooks desplegados: Preparacion_Ambiente, 1a.-Bronze-Extract_Clientes_Info_Operacional_Data, 1b.-Bronze-Extract_Clientes_Score_Operacional_Data, 2.-Silver-Transform_Renovacion_Prestamo_Data, 3.-Golden-Load_Renovacion_Prestamo, Grants_Security"
+        echo "Workflow creado: WF_ETL_Renovacion_Prestamo_PROD"
+        echo "Tareas configuradas:"
+        echo "   - tarea0_preamb (Preparacion_Ambiente)"
+        echo "   - tarea1a_Extract_Clientes_Info_Operacional_Data (1a.-Bronze-Extract_Clientes_Info_Operacional_Data)"
+        echo "   - tarea1b_Extract_Clientes_Score_Operacional_Data (1b.-Bronze-Extract_Clientes_Score_Operacional_Data)"
+        echo "   - tarea2_Transform_Renovacion_Prestamo_Data (2.-Silver-Transform_Renovacion_Prestamo_Data)"
+        echo "   - tarea3_Load_Renovacion_Prestamo (3.-Golden-Load_Renovacion_Prestamo)"
+        echo "   - tarea4_Grants (Grants_Security)"
+        echo "Cluster existente: cluster_SD configurado"
+        echo ""
+        echo "🔗 Accede a tu workspace de Databricks para ver el workflow en la sección 'Workflows'"
