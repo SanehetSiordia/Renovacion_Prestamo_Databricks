@@ -1,8 +1,8 @@
 name: Dynamic Databricks Notebook Deploy
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+    
 jobs:
   deploy:
     runs-on: ubuntu-latest
