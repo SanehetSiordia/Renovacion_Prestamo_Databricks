@@ -28,9 +28,9 @@ El pipeline procesa los datos a través de Azure Data Lake Storage Gen2 (ADLS) u
 | Capa | Ubicación en Storage | Formato | Descripción |
 | :--- | :--- | :--- | :--- |
 | **Raw** | `container/raw` | CSV | Archivos fuentes originales sin modificaciones. |
-| **Bronze** | `container/bronze` | Delta | Ingesta directa de los archivos Raw. Tablas: `info_operacional` y `score_operacional`. |
-| **Silver** | `container/silver` | Delta | Limpieza, joins y transformaciones. Tabla lista para ML: `renovacion_prestamo_transformed`. |
-| **Gold** | `container/gold` | Delta | Agregaciones de negocio para reportería. Tablas: `golden_renovacion_prestamo` y `perfil_comprador`. |
+| **Bronze** | `container/bronze` | Delta | Ingesta directa de los archivos Raw en las tablas: `renovacion_prestamo_clientes_info_operacional` y `renovacion_prestamo_clientes_score_financiero`. |
+| **Silver** | `container/silver` | Delta | Limpieza, joins y transformaciones para la tabla lista para ML: `renovacion_prestamo_transformed`. |
+| **Gold** | `container/gold` | Delta | Agregaciones de negocio para graficar reportes con las tablas: `golden_renovacion_prestamo` y `golden_renovacion_prestamo_perfil_comprador`. |
 
 ## ⚙️ Guía de Configuración y Despliegue
 
@@ -44,7 +44,7 @@ El pipeline procesa los datos a través de Azure Data Lake Storage Gen2 (ADLS) u
 1. **Preparar el Data Lake:** Crea los contenedores `raw`, `bronze`, `silver` y `golden` en tu ADLS Gen2. Carga los archivos CSV de la carpeta `/datasets` dentro del contenedor `raw`.
 2. **Entorno de Desarrollo:** Realiza un *Fork* de este repositorio. En tu Workspace de Databricks de Desarrollo, clona la rama `construccion`.
 3. **Entorno de Producción:** Configura tu Workspace productivo y crea un clúster Single Node llamado `cluster_SD`.
-4. **Configurar CI/CD:** Agrega los secretos de autenticación de Databricks (`DATABRICKS_HOST` y `DATABRICKS_TOKEN`) en los secretos de tu repositorio de GitHub.
+4. **Configurar CI/CD:** Agrega los secretos de autenticación de Databricks (`DATABRICKS_ORIGIN_HOST`, `DATABRICKS_ORIGIN_TOKEN`, `DATABRICKS_DEST_HOST` y `DATABRICKS_DEST_TOKEN`) en los secretos de tu repositorio de GitHub.
 5. **Validación e Integración:** Realiza tus cambios en la rama `construccion`, haz un `push` y abre un *Pull Request* hacia la rama `main`.
 6. **Despliegue Automático:** GitHub Actions validará el código y desplegará automáticamente los Notebooks y el Workflow en el entorno de producción.
 7. **Ejecución:** Ve a la sección de *Jobs & Pipelines* en Databricks Producción y ejecuta el Workflow generado: `WF_ETL_Renovacion_Prestamo_PROD`.
